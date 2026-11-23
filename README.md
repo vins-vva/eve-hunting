@@ -19,13 +19,32 @@ where the ratters are before you jump.
   kills in the last hour, with its distance, jumps, ship and pod kills. Choose Null, Null + Low
   or All. The connections table shows each exit's best spot and the NPC kills in range, both
   sortable.
-- **Filters**: search (system, region, signature, or a spot's name), high/low/null/W-space,
-  minimum ship size, new connections only.
+- **Route to a system**: type three letters of any k-space system and pick it from the list
+  (arrows and Enter work too). Both pages gain a *Jumps to …* column, the gate jumps from each
+  exit to that system, and sort by it, closest first. Clear the field to drop it.
+- **Points of interest**: a third page lists the systems you watch (an enemy staging, a trade
+  hub, anything else), each with an optional type and comment, and a number of jumps. Jita is there to start
+  with. Each shows how many Thera and Turnur exits are within its jumps and the closest one;
+  hover one to list those connections, click it to keep them listed. The green **+ Add point of interest**
+  button at the page's top right opens a dialog (the same three-letter search, type, comment, jumps); each row
+  has **Edit** and **Remove**, and − and + change its jumps directly.
+  On the Thera and Turnur pages, a **POI** column shows a pin on every exit within range of a
+  point of interest (red for an enemy staging, green for trading, blue for other, with how many
+  when several); click it for each one's type, jumps and comment. A click elsewhere, Esc or the
+  card's ✕ closes it.
+- **Routes**: click any number of jumps (the route column, the spots' distance, the points of
+  interest's jumps and their card) for the gate route behind it: each system with its
+  security, and the region where it changes. A click elsewhere or Esc closes it.
+- **Filters**: high/low/null/W-space, minimum ship size, new connections only.
 - **Quick links** for any connection or spot: copy the name (double-click a row), open the
   Dotlan region map on the system with the NPC layer, or zKillboard (Anoik.is for wormholes).
 - **Desktop niceties**: integrated titlebar, resizable splitter between the two tables, light,
-  dark or system theme, and the window, page, filters, sorts and layout restored on the next
-  launch.
+  dark or system theme, and the window, page, filters, route target, points of interest, sorts
+  and layout restored on the next launch.
+
+![Routing to Amarr: the connections sorted by the jumps from their exit](shots/route-dark.png)
+
+![Points of interest: the connections within six jumps of an enemy staging](shots/poi-dark.png)
 
 ![The settings dialog](shots/settings-dark.png)
 
@@ -56,9 +75,13 @@ each platform's conventions.
 
 ### Settings
 
-Settings are saved as JSON to `%APPDATA%\eve-scouting\settings.json` on Windows
-(`$XDG_CONFIG_HOME/eve-scouting/` or `~/.config/eve-scouting/` elsewhere). Delete the file to
-start over; **Settings → Reset filters** resets the filters only.
+Settings and points of interest are saved as JSON to `%APPDATA%\eve-scouting\settings.json` on
+Windows (`$XDG_CONFIG_HOME/eve-scouting/` or `~/.config/eve-scouting/` elsewhere), as soon as
+they change. The settings dialog resets one part at a time:
+
+- **Reset filters**: the route target, security, ship size, New only and the spots' security.
+- **Reset points of interest**: back to Jita alone (asks to confirm).
+- **Reset all**: everything as on a first launch except the window's place (asks to confirm).
 
 ## Development
 
@@ -74,7 +97,9 @@ cargo run -- --snap shots/thera-dark.png --scene demo --theme dark --size 1360x8
 ```
 
 Scenes: `demo`, `demo-turnur`, `demo-tall` (splitter dragged), `demo-null` (null-sec spots),
-`demo-settings` (dialog open), `demo-light` (light theme forced).
+`demo-settings` (dialog open), `demo-light` (light theme forced), `demo-route` (routing to
+Amarr), `demo-search` (system suggestions open), `demo-poi` (points of interest), `demo-poi-hint` (a POI pin's card), `demo-settings-confirm` (a reset to confirm),
+`demo-poi-add` and `demo-poi-edit` (its dialog).
 
 To regenerate the stargate map after CCP adds systems:
 
@@ -82,17 +107,27 @@ To regenerate the stargate map after CCP adds systems:
 python scripts/update_universe.py
 ```
 
+The app icon is drawn in `assets/icon.svg`. After editing it, regenerate the `.ico` that
+`build.rs` embeds in the exe (building on Windows needs the Windows SDK's `rc.exe`):
+
+```sh
+cargo run --example make_icon
+```
+
 ### Layout
 
 | Path | What |
 |---|---|
 | `src/main.rs` | Window setup, settings loading, titlebar |
-| `src/hubs.rs` | The hub pages: state, refresh thread, filters, hunting spots, view |
+| `src/hubs.rs` | The hub pages: state, refresh thread, filters, route search, hunting spots, view |
+| `src/hubs/poi.rs` | The points of interest page |
 | `src/api.rs` | EVE-Scout client |
-| `src/universe.rs` | Stargate map, ESI hourly stats, hunting spot search |
+| `src/universe.rs` | Stargate map (system search, routes), ESI hourly stats, hunting spot search |
 | `src/settings.rs` | Settings saved between runs |
 | `data/universe.tsv` | K-space systems and gates, generated by `scripts/update_universe.py` |
 | `fixtures/` | Saved API responses for tests and headless scenes |
+| `assets/` | The app icon (`icon.svg`, the `icon.ico` made from it) and its Windows resource file |
+| `build.rs` | Embeds the icon in the Windows executable |
 
 ## Credits
 

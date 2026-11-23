@@ -1,6 +1,6 @@
 //! The wormhole hub pages (Thera, Turnur) behind a left nav: state, periodic refresh, filters,
-//! hunting spots and view. Both pages share the data, the filters and the splitter; each keeps
-//! its own selection, sort and spot list.
+//! route search, hunting spots and view. Both pages share the data, the filters, the route
+//! target and the splitter; each keeps its own selection, sort and spot list.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -12,18 +12,21 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, TimeDelta, Utc};
 use rune::tok::TextStyle;
 use rune::{
-    Align, Color, Cursor, Cx, Drag, El, Icon, KeyEvent, Phase, TextEdit, Tx, Waker, WindowHandle, col, el, icon, row,
-    text,
+    Align, Color, Cursor, Cx, Drag, El, Icon, Key, KeyEvent, Phase, TextEdit, Tx, Waker, WindowHandle, col, el, icon,
+    row, text,
 };
 use rune_kit::shell::{self, PaneState, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
     Dialog,
-    Badge, BadgeVariant, Button, ButtonVariant, Cell, Checkbox, Kit, SegmentedControl, SortDir, Table, TableColumn,
-    TableState, TextInput,
+    Badge, BadgeVariant, Button, ButtonVariant, Cell, Checkbox, Kit, Placement, PopupItem, PopupList, SegmentedControl,
+    SortDir, Table, TableColumn, TableState, TextInput,
 };
 
+mod poi;
+mod route_card;
+
 use crate::api::{self, Hub, Signature, Space};
-use crate::settings::{self, PageSorts, Settings, ThemeChoice, WindowPlace};
+use crate::settings::{self, PageSorts, PoiKind, Settings, ThemeChoice, WindowPlace};
 use crate::universe::{self, Hunt, Spot, SpotSecurity, Stats};
 
 /// Time between two EVE-Scout requests.
@@ -48,10 +51,16 @@ const SPLIT_MIN_BOTTOM: f32 = 150.0;
 const SPLIT_MIN_TOP: f32 = 120.0;
 const SPLITTER_H: f32 = 10.0;
 
+/// The system search lists suggestions from this many characters on, at most `SUGGEST_MAX`.
+const SUGGEST_MIN: usize = 3;
+const SUGGEST_MAX: usize = 12;
+
 const SIZES: [&str; 5] = ["Any", "Medium+", "Large+", "XL+", "Capital"];
 
-/// The pages, in nav order.
+/// The hub pages, in nav order.
 const HUBS: [Hub; 2] = [Hub::Thera, Hub::Turnur];
+/// The points of interest page's number in the settings, after the hubs.
+const POI_PAGE: usize = HUBS.len();
 
 static THERA_ICON: Icon = Icon {
     name: "hub-thera",
@@ -70,6 +79,12 @@ fn hub_name(hub: Hub) -> &'static str {
         Hub::Turnur => "Turnur",
     }
 }
+
+static POI_ICON: Icon = Icon {
+    name: "page-poi",
+    view: 16.0,
+    body: r#"<path d="M8 14.2C8 14.2 3.2 9.6 3.2 6.4A4.8 4.8 0 0 1 12.8 6.4C12.8 9.6 8 14.2 8 14.2Z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/><circle cx="8" cy="6.4" r="1.7" fill="currentColor"/>"#,
+};
 
 fn hub_icon(hub: Hub) -> &'static Icon {
     match hub {
@@ -122,12 +137,40 @@ pub struct State {
     /// Every connection received at the last refresh, both hubs.
     all: Vec<Signature>,
     pages: [Page; 2],
-    /// Index of the page shown, in `HUBS`.
+    /// Index of the hub page shown, in `HUBS` (the last one, while `show_poi`).
     current: usize,
+    /// The points of interest page is shown.
+    show_poi: bool,
     nav: PaneState,
 
+    // Route: a system searched for, and the gate jumps from every system to it
+    search: SystemSearch,
+    target: Option<u64>,
+    /// Gate jumps from each k-space system to `target` (empty without one).
+    route: HashMap<u64, u32>,
+
+    // Points of interest
+    pois: Vec<poi::PoiEntry>,
+    /// The add / edit dialog, when open, and its fields: the system, type, comment and jumps.
+    poi_dialog: Option<poi::Editing>,
+    poi_search: SystemSearch,
+    poi_pick: Option<u64>,
+    poi_kind: Option<PoiKind>,
+    poi_comment: TextEdit,
+    poi_jumps: u32,
+    /// The one clicked, and the one under the pointer, which the lower table shows first.
+    poi_selected: Option<u64>,
+    poi_hovered: Option<u64>,
+    /// The connections near the point of interest shown, with their jumps to it, sorted.
+    poi_rows: Vec<(Signature, u32)>,
+    poi_table: TableState,
+    poi_sort: (String, SortDir),
+    /// The connection whose POI details card is open (its pin was clicked).
+    poi_hint: Option<String>,
+    /// The route card under a clicked number of jumps.
+    route_hint: Option<route_card::RouteHint>,
+
     // Filters (shared by the pages)
-    query: TextEdit,
     high: bool,
     low: bool,
     null: bool,
@@ -152,6 +195,8 @@ pub struct State {
     theme: ThemeChoice,
     /// The settings dialog is open.
     settings_open: bool,
+    /// The reset waiting for its confirmation in the settings dialog.
+    confirm_reset: Option<Reset>,
     /// Where the window was (and returns to when un-maximized), as last saved.
     window_place: Option<WindowPlace>,
     /// What was last written to the settings file.
@@ -199,15 +244,36 @@ pub fn init_with(saved: &Settings) -> State {
         page.spot_sort = (col.clone(), dir(*desc));
         page.spot_table.set_sort(col.clone(), dir(*desc));
     }
+    let target = Some(saved.target.trim()).filter(|x| !x.is_empty()).and_then(|x| universe::universe().find(x));
+    let pois = poi::load(&saved.pois);
+    let mut poi_table = TableState::new();
+    poi_table.set_sort("jumps", SortDir::Ascending);
     let mut nav = PaneState::new(180.0).range(140.0, 320.0);
     nav.set_width(saved.nav_width);
     nav.set_open(saved.nav_open);
     State {
         all: Vec::new(),
         pages,
-        current: saved.page.min(HUBS.len() - 1),
+        current: if saved.page < HUBS.len() { saved.page } else { 0 },
+        show_poi: saved.page == POI_PAGE,
+        poi_selected: pois.first().map(|p| p.id),
+        pois,
+        poi_dialog: None,
+        poi_search: SystemSearch::default(),
+        poi_pick: None,
+        poi_kind: None,
+        poi_comment: TextEdit::default(),
+        poi_jumps: poi::DEFAULT_JUMPS,
+        poi_hovered: None,
+        poi_rows: Vec::new(),
+        poi_table,
+        poi_sort: ("jumps".into(), SortDir::Ascending),
+        poi_hint: None,
+        route_hint: None,
         nav,
-        query: TextEdit::new(saved.query.clone()),
+        search: SystemSearch::new(target.and_then(system_name).unwrap_or_default()),
+        target,
+        route: target.map(|t| universe::universe().distances(t)).unwrap_or_default(),
         high: saved.high,
         low: saved.low,
         null: saved.null,
@@ -223,6 +289,7 @@ pub fn init_with(saved: &Settings) -> State {
         split_area_h: None,
         theme: saved.theme,
         settings_open: false,
+        confirm_reset: None,
         window_place: saved.window,
         saved: saved.clone(),
         loaded_once: false,
@@ -290,6 +357,7 @@ pub fn poll(s: &mut State, t: f64, tx: &mut Tx) -> bool {
     }
     tx.wake_after(Duration::from_secs_f64(CLOCK_TICK));
 
+
     let msgs = std::mem::take(&mut *s.inbox.lock().unwrap());
     for msg in msgs {
         let now = Utc::now();
@@ -338,8 +406,8 @@ fn snapshot(s: &State) -> Settings {
     let desc = |d: SortDir| d == SortDir::Descending;
     Settings {
         window: s.window_place,
-        page: s.current,
-        query: s.query.text.clone(),
+        page: if s.show_poi { POI_PAGE } else { s.current },
+        target: target_name(s).unwrap_or_default().to_string(),
         high: s.high,
         low: s.low,
         null: s.null,
@@ -356,23 +424,89 @@ fn snapshot(s: &State) -> Settings {
             .map(|p| PageSorts { connections: (p.sort.0.clone(), desc(p.sort.1)), spots: (p.spot_sort.0.clone(), desc(p.spot_sort.1)) })
             .collect(),
         theme: s.theme,
+        pois: poi::save(&s.pois),
     }
 }
 
-/// The filters at their defaults: search, security, ship size, new only, spot security.
+/// The filters at their defaults: route target, security, ship size, new only, spot security.
 fn filters_are_default(s: &State) -> bool {
     let d = Settings::default();
-    s.query.text.is_empty()
+    s.target.is_none()
+        && s.search.edit.text.is_empty()
         && (s.high, s.low, s.null, s.wormhole) == (d.high, d.low, d.null, d.wormhole)
         && s.min_size == d.min_size
         && s.only_new == d.only_new
         && s.spot_security.index() == d.spot_security
 }
 
+/// What the settings dialog can reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reset {
+    Filters,
+    Pois,
+    All,
+}
+
+impl Reset {
+    fn run(self, s: &mut State) {
+        match self {
+            Reset::Filters => reset_filters(s),
+            Reset::Pois => reset_pois(s),
+            Reset::All => reset_all(s),
+        }
+        s.confirm_reset = None;
+    }
+
+    /// Nothing to reset.
+    fn is_done(self, s: &State) -> bool {
+        match self {
+            Reset::Filters => filters_are_default(s),
+            Reset::Pois => poi::save(&s.pois) == settings::default_pois(),
+            Reset::All => everything_is_default(s),
+        }
+    }
+}
+
+/// The points of interest back to Jita alone.
+fn reset_pois(s: &mut State) {
+    s.pois = poi::load(&settings::default_pois());
+    s.poi_selected = s.pois.first().map(|p| p.id);
+    s.poi_hovered = None;
+    poi::refresh_rows(s);
+}
+
+/// Everything as on a first launch (filters, points of interest, sorts, splitter, nav, theme),
+/// but the window's place and the page shown.
+fn reset_all(s: &mut State) {
+    reset_filters(s);
+    reset_pois(s);
+    let fresh = init();
+    for (page, new) in s.pages.iter_mut().zip(&fresh.pages) {
+        page.sort = new.sort.clone();
+        page.table.set_sort(new.sort.0.clone(), new.sort.1);
+        page.spot_sort = new.spot_sort.clone();
+        page.spot_table.set_sort(new.spot_sort.0.clone(), new.spot_sort.1);
+    }
+    s.poi_sort = fresh.poi_sort.clone();
+    s.poi_table.set_sort(fresh.poi_sort.0.clone(), fresh.poi_sort.1);
+    s.bottom_h = fresh.bottom_h;
+    s.nav.set_width(fresh.nav.width());
+    s.nav.set_open(fresh.nav.is_open());
+    s.theme = fresh.theme;
+    apply(s);
+}
+
+/// Whether the settings are those of a first launch, the window's place and page aside.
+fn everything_is_default(s: &State) -> bool {
+    let now = snapshot(s);
+    let first = Settings { window: now.window, page: now.page, ..Settings::default() };
+    now == snapshot(&init_with(&first))
+}
+
 /// "Reset filters": every filter back to its default. Sorts, splitter and window stay.
 fn reset_filters(s: &mut State) {
     let d = Settings::default();
-    s.query = TextEdit::new("");
+    search_clear(s, Field::Route);
     (s.high, s.low, s.null, s.wormhole) = (d.high, d.low, d.null, d.wormhole);
     s.min_size = d.min_size;
     s.only_new = d.only_new;
@@ -416,13 +550,21 @@ pub fn on_close(s: &mut State, _: &mut Tx) {
 
 fn update_title(s: &State, tx: &mut Tx) {
     let n = new_count(s, None);
-    let page = hub_name(s.page().hub);
+    let page = if s.show_poi { "Points of interest" } else { hub_name(s.page().hub) };
     let title = if n > 0 { format!("{APP_NAME} — {page} ({n} new)") } else { format!("{APP_NAME} — {page}") };
     tx.set_title(&title);
 }
 
-/// ⇧Ctrl+B shows and hides the nav.
+/// ⇧Ctrl+B shows and hides the nav; Esc closes a route card, then a POI card.
 pub fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
+    if ev.key == Key::Escape && s.route_hint.is_some() {
+        route_card::close(s);
+        return true;
+    }
+    if ev.key == Key::Escape && s.poi_hint.is_some() {
+        poi::close_hint(s);
+        return true;
+    }
     if shell::is_sidebar_toggle(ev) {
         s.nav.toggle();
         return true;
@@ -456,8 +598,11 @@ fn request_refresh(s: &mut State) {
 }
 
 fn show_page(s: &mut State, i: usize, tx: &mut Tx) {
-    if s.current != i {
+    if s.current != i || s.show_poi {
         s.current = i;
+        s.show_poi = false;
+        poi::close_hint(s);
+        route_card::close(s);
         s.flash = None;
         update_title(s, tx);
     }
@@ -518,6 +663,189 @@ fn select_connection(s: &mut State, id: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// System search fields (the route's, and the points of interest form's)
+
+/// Which system search field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Route,
+    Poi,
+}
+
+impl Field {
+    /// The field's element key, which its suggestions hang from.
+    fn key(self) -> &'static str {
+        match self {
+            Field::Route => "system-search",
+            Field::Poi => "poi-search",
+        }
+    }
+
+    fn get(self, s: &State) -> &SystemSearch {
+        match self {
+            Field::Route => &s.search,
+            Field::Poi => &s.poi_search,
+        }
+    }
+
+    fn get_mut(self, s: &mut State) -> &mut SystemSearch {
+        match self {
+            Field::Route => &mut s.search,
+            Field::Poi => &mut s.poi_search,
+        }
+    }
+}
+
+/// A field finding a k-space system by name: its text, and the suggestions under it.
+#[derive(Default)]
+pub struct SystemSearch {
+    edit: TextEdit,
+    /// The suggestions are shown.
+    open: bool,
+    /// The suggestion the arrow keys are on.
+    active: usize,
+}
+
+impl SystemSearch {
+    fn new(text: impl Into<String>) -> SystemSearch {
+        SystemSearch { edit: TextEdit::new(text), ..SystemSearch::default() }
+    }
+
+    /// The systems suggested for the text: none under `SUGGEST_MIN` characters.
+    fn suggestions(&self) -> Vec<u64> {
+        let q = self.edit.text.trim();
+        if q.chars().count() < SUGGEST_MIN {
+            return Vec::new();
+        }
+        universe::universe().search(q, SUGGEST_MAX)
+    }
+
+    /// After an edit: suggest from the new text.
+    fn edited(&mut self) {
+        self.active = 0;
+        self.open = self.edit.text.trim().chars().count() >= SUGGEST_MIN;
+    }
+
+    /// Shows a chosen system's name, suggestions closed.
+    fn show(&mut self, name: &str) {
+        self.edit.replace_text(name.to_string());
+        self.edit.set_caret(name.len());
+        self.open = false;
+    }
+
+    fn clear(&mut self) {
+        self.edit.clear();
+        self.open = false;
+        self.active = 0;
+    }
+
+    /// Whether the text is `name`.
+    fn names(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case(self.edit.text.trim())
+    }
+}
+
+/// A field's text changed: suggest from it, and drop the system it no longer names.
+fn search_edited(s: &mut State, f: Field) {
+    f.get_mut(s).edited();
+    match f {
+        Field::Route => {
+            if target_name(s).is_some_and(|name| !s.search.names(name)) {
+                let open = s.search.open;
+                set_target(s, None);
+                s.search.open = open;
+            }
+        }
+        Field::Poi => {
+            if s.poi_pick.and_then(system_name).is_some_and(|name| !s.poi_search.names(name)) {
+                s.poi_pick = None;
+            }
+        }
+    }
+}
+
+/// A suggestion picked: the field shows its name, and the route is measured to it, or the
+/// point of interest form takes it.
+fn search_pick(s: &mut State, f: Field, id: u64) {
+    if let Some(name) = system_name(id) {
+        f.get_mut(s).show(name);
+    }
+    match f {
+        Field::Route => set_target(s, Some(id)),
+        Field::Poi => s.poi_pick = Some(id),
+    }
+}
+
+/// The field's ✕ (which only reports its press): empties it and drops its system.
+fn search_clear(s: &mut State, f: Field) {
+    f.get_mut(s).clear();
+    match f {
+        Field::Route => set_target(s, None),
+        Field::Poi => s.poi_pick = None,
+    }
+}
+
+/// Up and Down move through the suggestions, Enter picks one, Escape closes them.
+fn search_key(s: &mut State, f: Field, ev: &KeyEvent) -> bool {
+    let search = f.get_mut(s);
+    if !search.open || search.edit.is_composing() {
+        return false;
+    }
+    let list = search.suggestions();
+    match ev.key {
+        Key::Escape => search.open = false,
+        Key::Down if !list.is_empty() => search.active = (search.active + 1) % list.len(),
+        Key::Up if !list.is_empty() => search.active = (search.active + list.len() - 1) % list.len(),
+        Key::Enter => match list.get(search.active) {
+            Some(&id) => search_pick(s, f, id),
+            None => search.open = false,
+        },
+        _ => return false,
+    }
+    true
+}
+
+fn system_name(id: u64) -> Option<&'static str> {
+    universe::universe().system(id).map(|x| x.name.as_str())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Route: the gate jumps from each exit to a system searched for
+
+fn target_name(s: &State) -> Option<&'static str> {
+    s.target.and_then(system_name)
+}
+
+/// Gate jumps from the connection's exit to the target; none without a target, from a wormhole
+/// exit, or when no gates lead there.
+fn route_jumps(s: &State, sig: &Signature) -> Option<u32> {
+    s.target?;
+    s.route.get(&sig.in_system_id).copied()
+}
+
+/// Measures the route from every exit to `target`, and sorts every page by it, closest first.
+/// `None` drops the route, and its sort.
+fn set_target(s: &mut State, target: Option<u64>) {
+    s.search.open = false;
+    if s.target == target {
+        return;
+    }
+    s.target = target;
+    s.route = target.map(|t| universe::universe().distances(t)).unwrap_or_default();
+    for page in &mut s.pages {
+        if target.is_some() {
+            page.sort = ("route".into(), SortDir::Ascending);
+        } else if page.sort.0 == "route" {
+            page.sort = ("age".into(), SortDir::Ascending);
+        } else {
+            continue;
+        }
+        page.table.set_sort(page.sort.0.clone(), page.sort.1);
+    }
+    apply(s);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Splitter
 
 /// The tallest the hunting section may be, so the connections keep `SPLIT_MIN_TOP`.
@@ -550,7 +878,7 @@ fn new_count(s: &State, hub: Option<Hub>) -> usize {
     s.all.iter().filter(|x| hub.is_none_or(|h| x.hub() == h) && is_new(s, &x.id)).count()
 }
 
-fn keep(s: &State, hub: Hub, sig: &Signature, query: &str) -> bool {
+fn keep(s: &State, hub: Hub, sig: &Signature) -> bool {
     let space_ok = match sig.space() {
         Space::High => s.high,
         Space::Low => s.low,
@@ -559,21 +887,14 @@ fn keep(s: &State, hub: Hub, sig: &Signature, query: &str) -> bool {
     };
     let size_ok = s.min_size == 0 || sig.size_rank() >= s.min_size as u8;
     let new_ok = !s.only_new || is_new(s, &sig.id);
-    let query_ok = query.is_empty()
-        || [&sig.in_system_name, &sig.in_region_name, &sig.wh_type, &sig.out_signature, &sig.in_signature]
-            .iter()
-            .any(|f| f.to_lowercase().contains(query))
-        // A connection is also found by the name of a hunting spot within its range.
-        || s.hunts.get(&sig.id).is_some_and(|h| h.spots.iter().any(|x| x.name.to_lowercase().contains(query)));
-    sig.hub() == hub && space_ok && size_ok && new_ok && query_ok
+    sig.hub() == hub && space_ok && size_ok && new_ok
 }
 
 /// Recomputes every page's rows from `all`, the filters and its sort.
 fn apply(s: &mut State) {
-    let query = s.query.text.trim().to_lowercase();
     for i in 0..s.pages.len() {
         let hub = s.pages[i].hub;
-        let rows: Vec<Signature> = s.all.iter().filter(|x| keep(s, hub, x, &query)).cloned().collect();
+        let rows: Vec<Signature> = s.all.iter().filter(|x| keep(s, hub, x)).cloned().collect();
         s.pages[i].rows = rows;
         let (col, dir) = s.pages[i].sort.clone();
         sort(s, i, &col, dir);
@@ -583,6 +904,7 @@ fn apply(s: &mut State) {
         }
         refresh_spots(s, i);
     }
+    poi::refresh_rows(s);
 }
 
 fn sort(s: &mut State, i: usize, col: &str, dir: SortDir) {
@@ -590,8 +912,18 @@ fn sort(s: &mut State, i: usize, col: &str, dir: SortDir) {
     let new: HashSet<String> = rows.iter().filter(|r| is_new(s, &r.id)).map(|r| r.id.clone()).collect();
     let best = |id: &str| s.hunts.get(id).and_then(|h| h.best()).map_or(0, |x| x.act.npc_kills);
     let total = |id: &str| s.hunts.get(id).map_or(0, |h| h.total_npc);
+    let route = |sig: &Signature| route_jumps(s, sig).unwrap_or(u32::MAX);
     rows.sort_by(|a, b| {
         let o = match col {
+            "route" => route(a).cmp(&route(b)).then(b.created_at.cmp(&a.created_at)),
+            // Most points of interest near first (ascending), then the closest one.
+            "poi" => {
+                let key = |sig: &Signature| {
+                    let near = poi::near_exit(s, sig);
+                    (std::cmp::Reverse(near.len()), near.first().map_or(u32::MAX, |x| x.1))
+                };
+                key(a).cmp(&key(b))
+            }
             "state" => new.contains(&b.id).cmp(&new.contains(&a.id)),
             "system" => rune_kit::natural_cmp(&a.in_system_name, &b.in_system_name),
             "class" => a.in_system_class.cmp(&b.in_system_class),
@@ -700,22 +1032,31 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = Kit::neutral(s.theme.is_dark(cx.system_dark()));
     // The caption buttons follow the app's theme, not the system's.
     cx.caption_color(k.c.text_base);
-    let hub = hub_name(s.page().hub);
+    let title = if s.show_poi { "Points of interest".to_string() } else { format!("{} connections", hub_name(s.page().hub)) };
     // The toolbar is the window's titlebar: it drags the window, and on Windows Rune draws the
     // minimize, maximize and close buttons over its trailing end, which the actions keep clear of.
     let caption = el().key("caption-space").w(cx.chrome_insets().trailing).h(1.0);
     let toolbar = Toolbar::new()
         .leading(brand(&k))
-        .title(format!("{hub} connections"))
+        .title(title)
         .trailing(toolbar_actions(s, &k))
         .trailing(caption);
-    let body = SplitView::new(hub_page(s, &k))
+    let page = if s.show_poi { poi::page(s, &k) } else { hub_page(s, &k) };
+    let body = SplitView::new(page)
         .sidebar(&s.nav, |s: &mut State| &mut s.nav, nav(s, &k))
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .reduced_motion(cx.is_reduced_motion())
         .build(&k);
     let mut layer = Vec::new();
+    if !s.show_poi {
+        poi::exit_card(s, &k, &mut layer);
+    }
+    route_card::card(s, &k, &mut layer);
+    poi::dialog(s, &k, &mut layer);
+    // After the dialog, so its system suggestions show over it.
+    system_suggestions(s, &k, Field::Route, &mut layer);
+    system_suggestions(s, &k, Field::Poi, &mut layer);
     settings_dialog(s, &k, &mut layer);
     rune_kit::root(body, layer)
 }
@@ -726,7 +1067,7 @@ static GEAR: Icon = Icon {
     body: r#"<path d="M3 5H13M3 11H13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="6" cy="5" r="1.6" fill="currentColor"/><circle cx="10.5" cy="11" r="1.6" fill="currentColor"/>"#,
 };
 
-/// The settings dialog: theme, and resetting the filters.
+/// The settings dialog: theme, and resetting the filters, the points of interest or everything.
 fn settings_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
     let section = |title: &str, hint: &str, control: El| {
         row()
@@ -751,25 +1092,63 @@ fn settings_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         .on_pick(|s: &mut State, i, _| s.theme = ThemeChoice::from_index(i))
         .build(k)
         .key("theme");
-    let reset = Button::new("Reset filters")
-        .variant(ButtonVariant::Neutral)
-        .disabled(filters_are_default(s))
-        .on_press(reset_filters)
-        .build(k)
-        .key("reset-filters");
+    // Each reset button; the points of interest and everything ask once more first.
+    let reset_control = |which: Reset, label: &'static str, key: &'static str| -> El {
+        if s.confirm_reset == Some(which) {
+            return row()
+                .key(key)
+                .gap(6.0)
+                .center_y()
+                .child(
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut State| s.confirm_reset = None)
+                        .build(k)
+                        .key("cancel"),
+                )
+                .child(Button::new("Reset").variant(ButtonVariant::Danger).on_press(move |s: &mut State| which.run(s)).build(k).key("confirm"));
+        }
+        Button::new(label)
+            .variant(ButtonVariant::Neutral)
+            .disabled(which.is_done(s))
+            .on_press(move |s: &mut State| match which {
+                Reset::Filters => which.run(s),
+                _ => s.confirm_reset = Some(which),
+            })
+            .build(k)
+            .key(key)
+    };
+    let heading = |title: &str| {
+        text(title.to_string()).font(k.ty.small_medium).color(k.c.text_muted).pt(14.0).pb(2.0)
+    };
+    let pois_hint = if s.confirm_reset == Some(Reset::Pois) {
+        "Delete your points of interest and keep Jita alone? This can't be undone.".to_string()
+    } else {
+        let n = s.pois.len();
+        format!("Back to Jita alone. Your {n} point{} of interest, types and comments are deleted.", plural(n))
+    };
+    let all_hint = if s.confirm_reset == Some(Reset::All) {
+        "Reset everything, points of interest included? This can't be undone."
+    } else {
+        "Filters, points of interest, sorts, splitter, nav and theme, as on a first launch. The window stays where it is."
+    };
     let body = col()
         .key("settings-body")
         .w_full()
         .px(16.0)
         .pb(16.0)
         .child(section("Theme", "System follows Windows' light or dark mode.", theme))
+        .child(el().w_full().h(1.0).fill(k.c.border_muted).mt(6.0))
+        .child(heading("RESET"))
         .child(section(
             "Filters",
-            "Search, security, ship size, New only and the hunting spots' security, on both pages.",
-            reset,
+            "Route target, security, ship size, New only and the hunting spots' security, on both pages.",
+            reset_control(Reset::Filters, "Reset filters", "reset-filters"),
         ))
+        .child(section("Points of interest", &pois_hint, reset_control(Reset::Pois, "Reset points of interest", "reset-pois")))
+        .child(section("Everything", all_hint, reset_control(Reset::All, "Reset all", "reset-all")))
         .child(
-            text(format!("Saved in {}", settings::path().display()))
+            text(format!("Settings and points of interest are saved in {}", settings::path().display()))
                 .font(k.ty.small)
                 .color(k.c.text_faint)
                 .truncate()
@@ -779,7 +1158,10 @@ fn settings_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         .open(s.settings_open)
         .width(520.0)
         .fit()
-        .on_close(|s: &mut State| s.settings_open = false)
+        .on_close(|s: &mut State| {
+            s.settings_open = false;
+            s.confirm_reset = None;
+        })
         .child(body)
         .build(k, layer);
 }
@@ -800,7 +1182,7 @@ fn nav(s: &State, k: &Kit) -> El {
             let mut r = SidebarRow::new(hub_name(hub))
                 .icon(hub_icon(hub))
                 .height(32.0)
-                .selected(s.current == i)
+                .selected(!s.show_poi && s.current == i)
                 .on_select(move |s: &mut State, tx| show_page(s, i, tx));
             match new_count(s, Some(hub)) {
                 0 => r = r.detail(count.to_string()),
@@ -808,12 +1190,27 @@ fn nav(s: &State, k: &Kit) -> El {
             }
             sb.child(r.build(k).key(format!("nav-{}", hub_name(hub).to_lowercase())))
         })
+        .child(
+            SidebarRow::new("Points of interest")
+                .icon(&POI_ICON)
+                .height(32.0)
+                .selected(s.show_poi)
+                .detail(s.pois.len().to_string())
+                .on_select(|s: &mut State, tx| {
+                    route_card::close(s);
+                    s.show_poi = true;
+                    s.flash = None;
+                    update_title(s, tx);
+                })
+                .build(k)
+                .key("nav-poi"),
+        )
         .build(k)
 }
 
 fn toolbar_actions(s: &State, k: &Kit) -> El {
     let mut bar = row().gap(6.0).center_y();
-    if new_count(s, Some(s.page().hub)) > 0 {
+    if !s.show_poi && new_count(s, Some(s.page().hub)) > 0 {
         bar = bar.child(
             Button::new("Mark all as seen")
                 .variant(ButtonVariant::Ghost)
@@ -930,13 +1327,7 @@ fn status(s: &State, k: &Kit) -> El {
 }
 
 fn filters(s: &State, k: &Kit) -> El {
-    let search = TextInput::new(&s.query)
-        .placeholder("System, region, sig, spot…")
-        .leading_icon(k.glyph.search)
-        .clear_button()
-        .on_edit(|s: &mut State| &mut s.query)
-        .on_change(|s: &mut State, _| apply(s))
-        .build(k);
+    let search = system_field(s, k, Field::Route, "Route to a system…");
     let size = SegmentedControl::new(&SIZES, Some(s.min_size))
         .label("Minimum ship size")
         .fit()
@@ -978,6 +1369,62 @@ fn filters(s: &State, k: &Kit) -> El {
         )
 }
 
+/// A system search field: a name, suggestions from three letters (`system_suggestions`).
+fn system_field(s: &State, k: &Kit, f: Field, placeholder: &str) -> El {
+    let search = f.get(s);
+    let active = search
+        .open
+        .then(|| search.suggestions().get(search.active).map(|id| format!("{}-list-option-{id}", f.key())))
+        .flatten();
+    TextInput::new(&search.edit)
+        .placeholder(placeholder)
+        .label(placeholder.trim_end_matches('…'))
+        .leading_icon(k.glyph.search)
+        .clear_button()
+        .width(Some(260.0))
+        .active_descendant(active)
+        .on_edit(move |s: &mut State| &mut f.get_mut(s).edit)
+        .on_change(move |s: &mut State, _| search_edited(s, f))
+        .on_key(move |s: &mut State, ev, _| search_key(s, f, ev))
+        .on_action(move |s: &mut State, _| search_clear(s, f))
+        .build(k)
+        .key(f.key())
+}
+
+/// The systems matching a search field's text, under it.
+fn system_suggestions(s: &State, k: &Kit, f: Field, layer: &mut Vec<El>) {
+    let search = f.get(s);
+    if !search.open {
+        return;
+    }
+    let u = universe::universe();
+    let items: Vec<PopupItem> = search
+        .suggestions()
+        .into_iter()
+        .filter_map(|id| {
+            let sys = u.system(id)?;
+            let sec = text(format!("{:.1}", sys.display_sec())).font(k.ty.mono).color(space_color(k, sys.space())).w(30.0);
+            Some(PopupItem::new(id.to_string(), &sys.name).description(&sys.region).leading(sec))
+        })
+        .collect();
+    PopupList::new(format!("{}-list", f.key()), f.key())
+        .placement(Placement::BottomStart)
+        .label("Systems")
+        .width(320.0)
+        .max_height(SUGGEST_MAX as f32 * 28.0)
+        .items(items)
+        .active(Some(search.active))
+        .empty_message("No k-space system by that name")
+        .on_active(move |s: &mut State, i| f.get_mut(s).active = i)
+        .on_choose(move |s: &mut State, id, _| {
+            if let Ok(id) = id.parse() {
+                search_pick(s, f, id);
+            }
+        })
+        .on_close(move |s: &mut State| f.get_mut(s).open = false)
+        .build(k, layer);
+}
+
 /// The signature to scan down in the hub, drawn as an amber pill so it stands out in the row.
 fn hub_sig_pill(k: &Kit, sig: &str) -> El {
     let style = TextStyle { weight: 650.0, ..k.ty.mono };
@@ -993,7 +1440,9 @@ fn hub_sig_pill(k: &Kit, sig: &str) -> El {
 fn connections(s: &State, k: &Kit) -> El {
     let ck = k.clone();
     let hub = hub_name(s.page().hub);
-    Table::new(
+    // The closest exit to the target, highlighted.
+    let closest = s.page().rows.iter().filter_map(|r| route_jumps(s, r)).min();
+    let mut table = Table::new(
         |s: &State| &s.page().table,
         |s: &mut State| &mut s.page_mut().table,
         |s: &State| s.page().rows.len(),
@@ -1001,7 +1450,12 @@ fn connections(s: &State, k: &Kit) -> El {
     )
     .name(format!("{hub} connections"))
     .column(TableColumn::new("state", "").width(56.0).resizable(false).sortable())
-    .column(TableColumn::new("system", "System").flex(1.0).min(96.0).sortable())
+    .column(TableColumn::new("system", "System").flex(1.0).min(96.0).sortable());
+    if let Some(name) = target_name(s) {
+        table = table.column(TableColumn::new("route", format!("Jumps to {name}")).width(140.0).align(Align::End).sortable());
+    }
+    table
+    .column(TableColumn::new("poi", "POI").width(64.0).sortable())
     .column(TableColumn::new("class", "Class").width(56.0).sortable())
     .column(TableColumn::new("region", "Region").flex(0.7).min(90.0).sortable())
     .column(TableColumn::new("hub_sig", format!("{hub} sig")).width(96.0).sortable())
@@ -1019,6 +1473,14 @@ fn connections(s: &State, k: &Kit) -> El {
         match column {
             "state" if is_new(s, &sig.id) => Cell::el(Badge::new("NEW").variant(BadgeVariant::Accent).build(k)),
             "system" => Cell::text(&sig.in_system_name),
+            "route" => match (route_jumps(s, sig), s.target) {
+                (Some(n), Some(target)) => {
+                    let color = if Some(n) == closest { k.c.text_accent } else { k.c.text_base };
+                    Cell::el(route_card::jumps(s, k, format!("route-conn-{}", sig.id), sig.in_system_id, target, n.to_string(), color))
+                }
+                _ => Cell::text("—").muted(),
+            },
+            "poi" => poi::exit_cell(s, k, sig).map_or_else(|| Cell::text(""), Cell::el),
             "class" => Cell::text(sig.class_label()).color(space_color(k, sig.space())),
             "region" => Cell::text(&sig.in_region_name).muted(),
             "hub_sig" => Cell::el(hub_sig_pill(k, &sig.out_signature)),
@@ -1128,6 +1590,11 @@ fn details(s: &State, k: &Kit) -> El {
         sig.size_label(),
         duration(sig.expires_at - s.now)
     );
+    let summary = match (target_name(s), route_jumps(s, sig)) {
+        (Some(name), Some(n)) => format!("{summary} · {n} jump{} to {name}", plural(n as usize)),
+        (Some(name), None) => format!("{summary} · no gate route to {name}"),
+        _ => summary,
+    };
     let mut bar = bar.child(text(summary).font(k.ty.text_small).color(k.c.text_base).truncate().grow(1.0).min_w(0.0));
     if let Some(flash) = &s.flash {
         bar = bar.child(text(flash.clone()).font(k.ty.text_small).color(k.c.text_muted));
@@ -1208,7 +1675,18 @@ fn spots(s: &State, k: &Kit) -> El {
             "system" => Cell::text(&x.name),
             "sec" => Cell::text(format!("{:.1}", x.sec)).mono().color(space_color(k, x.space)),
             "region" => Cell::text(&x.region).muted(),
-            "distance" => Cell::text(jumps_label(x.distance)).mono(),
+            "distance" => match selected_signature(s) {
+                Some(sig) => Cell::el(route_card::jumps(
+                    s,
+                    k,
+                    format!("route-spot-{}", x.id),
+                    sig.in_system_id,
+                    x.id,
+                    jumps_label(x.distance),
+                    k.c.text_base,
+                )),
+                None => Cell::text(jumps_label(x.distance)).mono(),
+            },
             "npc" => {
                 let c = Cell::text(x.act.npc_kills.to_string()).mono();
                 if x.act.npc_kills >= HOT_NPC { c.color(k.c.text_accent) } else { c }
@@ -1246,13 +1724,49 @@ pub const SCENES: &[(&str, fn(&mut State))] =
         ("demo-null", demo_null),
         ("demo-settings", demo_settings),
         ("demo-light", demo_light),
+        ("demo-route", demo_route),
+        ("demo-search", demo_search),
+        ("demo-poi", demo_poi),
+        ("demo-poi-hint", demo_poi_hint),
+        ("demo-settings-confirm", demo_settings_confirm),
+        ("demo-poi-add", demo_poi_add),
+        ("demo-poi-edit", demo_poi_edit),
     ];
+
+/// A route target chosen: the jumps column, every page sorted by it.
+fn demo_route(s: &mut State) {
+    demo(s);
+    search_pick(s, Field::Route, universe::universe().find("Amarr").unwrap_or(30002187));
+}
+
+/// Typing in the search: the suggestions open under it.
+fn demo_search(s: &mut State) {
+    demo(s);
+    s.search = SystemSearch::new("ama");
+    s.search.edit.focused = true;
+    search_edited(s, Field::Route);
+    s.search.active = 1;
+}
 
 /// The settings dialog open, over filtered connections (so "Reset filters" is on).
 fn demo_settings(s: &mut State) {
     s.null = false;
     demo(s);
     s.settings_open = true;
+}
+
+/// A Thera page with points of interest near some exits, one's details open.
+fn demo_poi_hint(s: &mut State) {
+    demo_poi(s);
+    s.show_poi = false;
+    s.poi_hint = s.pages[0].rows.iter().find(|r| !poi::near_exit(s, r).is_empty()).map(|r| r.id.clone());
+}
+
+/// The settings dialog asking to confirm resetting the points of interest.
+fn demo_settings_confirm(s: &mut State) {
+    demo_poi(s);
+    s.settings_open = true;
+    s.confirm_reset = Some(Reset::Pois);
 }
 
 /// The light theme forced, whatever the system uses.
@@ -1300,6 +1814,36 @@ fn demo(s: &mut State) {
     }
 }
 
+/// The points of interest page, with an enemy staging added.
+fn demo_poi(s: &mut State) {
+    demo(s);
+    s.show_poi = true;
+    if let Some(id) = universe::universe().find("Amarr") {
+        s.pois.push(poi::PoiEntry::new(id, Some(PoiKind::EnemyStaging), "Their home, undock camps", 6));
+    }
+    if let Some(id) = universe::universe().find("Tama") {
+        s.pois.push(poi::PoiEntry::new(id, Some(PoiKind::Other), "", 8));
+    }
+    poi::refresh_rows(s);
+}
+
+/// The add dialog, with a system being searched for.
+fn demo_poi_add(s: &mut State) {
+    demo_poi(s);
+    poi::open_add(s);
+    s.poi_search = SystemSearch::new("1dq");
+    s.poi_search.edit.focused = true;
+    search_edited(s, Field::Poi);
+}
+
+/// The edit dialog on the enemy staging.
+fn demo_poi_edit(s: &mut State) {
+    demo_poi(s);
+    if let Some(id) = universe::universe().find("Amarr") {
+        poi::open_edit(s, id);
+    }
+}
+
 fn demo_turnur(s: &mut State) {
     demo(s);
     s.current = 1;
@@ -1315,7 +1859,7 @@ fn demo_tall(s: &mut State) {
 mod tests {
     use super::*;
 
-    fn loaded() -> State {
+    pub(crate) fn loaded() -> State {
         let mut s = init();
         demo(&mut s);
         s
@@ -1429,7 +1973,7 @@ mod tests {
         let saved = Settings {
             window: Some(WindowPlace { x: 40, y: 30, width: 1500, height: 900, maximized: true }),
             page: 1,
-            query: "omist".into(),
+            target: "Amarr".into(),
             low: false,
             wormhole: false,
             min_size: 2,
@@ -1447,7 +1991,9 @@ mod tests {
         };
         let s = init_with(&saved);
         assert_eq!(s.current, 1);
-        assert_eq!(s.query.text, "omist");
+        assert_eq!(s.search.edit.text, "Amarr");
+        assert_eq!(s.target, universe::universe().find("Amarr"));
+        assert!(!s.route.is_empty(), "the route is measured at launch");
         assert_eq!(s.pages[0].table.sort(), Some(("best", SortDir::Descending)));
         assert_eq!(snapshot(&s), saved, "what is loaded is what would be saved");
     }
@@ -1455,7 +2001,7 @@ mod tests {
     #[test]
     fn reset_filters_restores_every_filter_and_nothing_else() {
         let mut s = loaded();
-        s.query = TextEdit::new("omist");
+        search_pick(&mut s, Field::Route, universe::universe().find("Amarr").unwrap());
         s.null = false;
         s.min_size = 3;
         s.only_new = true;
@@ -1470,6 +2016,126 @@ mod tests {
         assert_eq!(s.pages[0].rows.len(), s.all.iter().filter(|x| x.hub() == Hub::Thera).count(), "every connection is back");
         assert_eq!((s.bottom_h, s.theme), (500.0, ThemeChoice::Light), "layout and theme stay");
         assert_eq!(s.pages[0].sort.0, "best", "sorts stay");
+    }
+
+    #[test]
+    fn choosing_a_system_sorts_every_page_by_the_route_to_it() {
+        let mut s = loaded();
+        let amarr = universe::universe().find("Amarr").unwrap();
+        search_pick(&mut s, Field::Route, amarr);
+        assert_eq!(s.search.edit.text, "Amarr");
+        assert!(!s.search.open);
+        for page in &s.pages {
+            assert_eq!(page.sort, ("route".to_string(), SortDir::Ascending));
+            assert_eq!(page.table.sort(), Some(("route", SortDir::Ascending)));
+            let jumps: Vec<u32> = page.rows.iter().map(|r| route_jumps(&s, r).unwrap_or(u32::MAX)).collect();
+            assert!(jumps.windows(2).all(|w| w[0] <= w[1]), "closest first: {jumps:?}");
+            assert!(page.rows.iter().filter(|r| r.space() != Space::Wormhole).all(|r| route_jumps(&s, r).is_some()));
+            assert!(page.rows.iter().filter(|r| r.space() == Space::Wormhole).all(|r| route_jumps(&s, r).is_none()));
+        }
+    }
+
+    #[test]
+    fn editing_the_name_drops_the_route() {
+        let mut s = loaded();
+        search_pick(&mut s, Field::Route, universe::universe().find("Amarr").unwrap());
+        s.search.edit.replace_text("Amar");
+        search_edited(&mut s, Field::Route);
+        assert_eq!(s.target, None);
+        assert!(s.route.is_empty());
+        assert!(s.search.open, "the suggestions come back for the new text");
+        assert!(s.pages.iter().all(|p| p.sort.0 == "age"), "the route's sort goes with it");
+    }
+
+    #[test]
+    fn the_clear_button_empties_the_field_and_drops_the_route() {
+        let mut s = loaded();
+        search_pick(&mut s, Field::Route, universe::universe().find("Amarr").unwrap());
+        search_clear(&mut s, Field::Route);
+        assert_eq!(s.search.edit.text, "");
+        assert_eq!((s.target, s.search.open), (None, false));
+        assert!(s.route.is_empty());
+        assert!(s.pages.iter().all(|p| p.sort.0 == "age"));
+        assert!(filters_are_default(&s));
+    }
+
+    #[test]
+    fn suggestions_start_at_three_characters_and_follow_the_keys() {
+        let mut s = loaded();
+        let key = |k| KeyEvent { key: k, mods: rune::Mods::default() };
+        let f = Field::Route;
+        s.search = SystemSearch::new("am");
+        search_edited(&mut s, f);
+        assert!(!s.search.open && s.search.suggestions().is_empty());
+        s.search = SystemSearch::new("ama");
+        search_edited(&mut s, f);
+        assert!(s.search.open);
+        let list = s.search.suggestions();
+        assert!(list.len() > 1 && list.len() <= SUGGEST_MAX);
+        assert!(search_key(&mut s, f, &key(Key::Down)));
+        assert_eq!(s.search.active, 1);
+        assert!(search_key(&mut s, f, &key(Key::Up)) && search_key(&mut s, f, &key(Key::Up)));
+        assert_eq!(s.search.active, list.len() - 1, "the arrows loop");
+        assert!(search_key(&mut s, f, &key(Key::Enter)));
+        assert_eq!(s.target, Some(list[list.len() - 1]));
+        assert!(!s.search.open);
+        assert!(!search_key(&mut s, f, &key(Key::Down)), "closed, the keys go to the field");
+    }
+
+
+    #[test]
+    fn resetting_the_points_of_interest_keeps_jita_alone_and_nothing_else() {
+        let mut s = loaded();
+        s.pois.push(poi::PoiEntry::new(universe::universe().find("Amarr").unwrap(), Some(PoiKind::EnemyStaging), "Goons", 5));
+        s.null = false;
+        apply(&mut s);
+        assert!(!Reset::Pois.is_done(&s));
+        Reset::Pois.run(&mut s);
+        assert!(Reset::Pois.is_done(&s));
+        assert_eq!(poi::save(&s.pois), settings::default_pois());
+        assert!(!s.null, "the filters stay");
+    }
+
+    #[test]
+    fn resetting_everything_gives_a_first_launch_but_the_window() {
+        let mut s = loaded();
+        let place = Some(WindowPlace { x: 10, y: 20, width: 1400, height: 900, maximized: false });
+        s.window_place = place;
+        s.show_poi = true;
+        search_pick(&mut s, Field::Route, universe::universe().find("Amarr").unwrap());
+        s.pois.push(poi::PoiEntry::new(universe::universe().find("Amarr").unwrap(), None, "", 5));
+        s.theme = ThemeChoice::Dark;
+        s.bottom_h = 500.0;
+        s.nav.set_width(250.0);
+        sort(&mut s, 1, "best", SortDir::Descending);
+        assert!(!everything_is_default(&s));
+        Reset::All.run(&mut s);
+        assert!(everything_is_default(&s));
+        assert!(Reset::Filters.is_done(&s) && Reset::Pois.is_done(&s));
+        let now = snapshot(&s);
+        assert_eq!((now.window, now.page), (place, POI_PAGE), "the window and the page stay");
+        assert_eq!(now, Settings { window: place, page: POI_PAGE, ..snapshot(&init()) });
+    }
+
+    #[test]
+    fn the_poi_column_lists_the_points_of_interest_within_their_range() {
+        let mut s = loaded();
+        let amarr = universe::universe().find("Amarr").unwrap();
+        s.pois.push(poi::PoiEntry::new(amarr, Some(PoiKind::EnemyStaging), "", 6));
+        let u = universe::universe();
+        for sig in &s.all {
+            let near = poi::near_exit(&s, sig);
+            for p in &s.pois {
+                let d = u.distances(p.id).get(&sig.in_system_id).copied();
+                let listed = near.iter().find(|(x, _)| x.id == p.id).map(|x| x.1);
+                assert_eq!(listed, d.filter(|d| *d <= p.jumps), "{} from {}", p.name(), sig.in_system_name);
+            }
+            assert!(near.windows(2).all(|w| w[0].1 <= w[1].1), "closest first");
+        }
+        assert!(s.all.iter().any(|x| !poi::near_exit(&s, x).is_empty()), "the fixtures have exits near Jita or Amarr");
+        sort(&mut s, 0, "poi", SortDir::Ascending);
+        let counts: Vec<usize> = s.pages[0].rows.iter().map(|r| poi::near_exit(&s, r).len()).collect();
+        assert!(counts.windows(2).all(|w| w[0] >= w[1]), "most first: {counts:?}");
     }
 
     #[test]

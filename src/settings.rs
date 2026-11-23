@@ -1,6 +1,6 @@
 //! User settings kept between runs: the window's place, the page shown, the filters, the
-//! sorts, the splitter and the nav. Stored as JSON in `%APPDATA%\eve-scouting\settings.json`
-//! (`$XDG_CONFIG_HOME` or `~/.config` elsewhere). A missing or unreadable file gives defaults.
+//! route target, the sorts, the splitter and the nav. Stored as JSON in
+//! `%APPDATA%\eve-scouting\settings.json` (`$XDG_CONFIG_HOME` or `~/.config` elsewhere). A missing or unreadable file gives defaults.
 
 use std::path::PathBuf;
 
@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Settings {
     pub window: Option<WindowPlace>,
-    /// Index of the page shown (0 Thera, 1 Turnur).
+    /// Index of the page shown (0 Thera, 1 Turnur, 2 Points of interest).
     pub page: usize,
-    pub query: String,
+    /// The system a route is measured to (its name), or empty.
+    pub target: String,
     pub high: bool,
     pub low: bool,
     pub null: bool,
@@ -28,6 +29,47 @@ pub struct Settings {
     /// Per page, the connections' and the spots' sort: (column, descending).
     pub sorts: Vec<PageSorts>,
     pub theme: ThemeChoice,
+    /// The points of interest, in the order they were added.
+    pub pois: Vec<Poi>,
+}
+
+/// A system worth watching: the connections within `jumps` gate jumps of it are listed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Poi {
+    /// The system's name.
+    pub system: String,
+    #[serde(default)]
+    pub kind: Option<PoiKind>,
+    /// A note of the user's ("Goons' staging", "cheap ammo"); empty for none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    pub jumps: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PoiKind {
+    EnemyStaging,
+    Trading,
+    Other,
+}
+
+impl PoiKind {
+    /// In the order the UI lists them.
+    pub const ALL: [PoiKind; 3] = [PoiKind::EnemyStaging, PoiKind::Trading, PoiKind::Other];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PoiKind::EnemyStaging => "Enemy staging",
+            PoiKind::Trading => "Trading system",
+            PoiKind::Other => "Other",
+        }
+    }
+}
+
+/// The points of interest a first launch starts with: Jita.
+pub fn default_pois() -> Vec<Poi> {
+    vec![Poi { system: "Jita".into(), kind: Some(PoiKind::Trading), comment: String::new(), jumps: 10 }]
 }
 
 /// The app's appearance: the system's, or always light or dark.
@@ -99,7 +141,7 @@ impl Default for Settings {
         Settings {
             window: None,
             page: 0,
-            query: String::new(),
+            target: String::new(),
             high: true,
             low: true,
             null: true,
@@ -112,6 +154,7 @@ impl Default for Settings {
             nav_open: true,
             sorts: Vec::new(),
             theme: ThemeChoice::System,
+            pois: default_pois(),
         }
     }
 }
@@ -150,7 +193,7 @@ mod tests {
         let s = Settings {
             window: Some(WindowPlace { x: 100, y: 50, width: 1360, height: 880, maximized: false }),
             page: 1,
-            query: "omist".into(),
+            target: "Amarr".into(),
             null: false,
             min_size: 3,
             sorts: vec![PageSorts { connections: ("best".into(), true), spots: ("jumps".into(), false) }],
@@ -166,6 +209,22 @@ mod tests {
         assert_eq!(s.page, 1);
         assert!(s.high && s.nav_open);
         assert_eq!(s.bottom_h, Settings::default().bottom_h);
+    }
+
+    #[test]
+    fn jita_is_the_first_point_of_interest_and_an_empty_list_stays_empty() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.pois, default_pois());
+        assert_eq!(s.pois[0].system, "Jita");
+        let s: Settings = serde_json::from_str(r#"{"pois": []}"#).unwrap();
+        assert!(s.pois.is_empty(), "removing Jita sticks");
+        let s: Settings = serde_json::from_str(r#"{"pois": [{"system": "Amarr", "jumps": 5}]}"#).unwrap();
+        assert_eq!(s.pois[0].kind, None, "the type is optional");
+        assert_eq!(s.pois[0].comment, "", "so is the comment");
+        let poi = Poi { system: "1DQ1-A".into(), kind: Some(PoiKind::EnemyStaging), comment: "Goons".into(), jumps: 3 };
+        let json = serde_json::to_string(&poi).unwrap();
+        assert!(json.contains(r#""kind":"enemy-staging""#) && json.contains(r#""comment":"Goons""#), "{json}");
+        assert_eq!(serde_json::from_str::<Poi>(&json).unwrap(), poi);
     }
 
     #[test]

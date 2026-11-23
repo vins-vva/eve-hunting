@@ -13,6 +13,10 @@
 //! `cargo run -- --snap thera.png --scene demo` renders the page headless from the data in
 //! `fixtures/` (no network, default settings).
 
+// A GUI program on Windows: launching the exe opens the window only, with no console beside it.
+// The console stays for debug builds, where Rune's and the app's messages are useful.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod api;
 mod hubs;
 mod settings;
@@ -33,6 +37,9 @@ fn main() {
         )
     });
     HEADLESS.store(headless, Ordering::Relaxed);
+    // The window, taskbar and Alt+Tab show the exe's own icon (embedded by build.rs).
+    #[cfg(windows)]
+    rune::set_app_icon_resource(1);
     rune::prewarm_gpu();
 
     let saved = if headless { settings::Settings::default() } else { settings::load() };

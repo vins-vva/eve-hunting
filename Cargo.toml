@@ -12,3 +12,12 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+# Embeds assets/icon.ico in the Windows executable (build.rs).
+embed-resource = "3"
+
+[dev-dependencies]
+# `cargo run --example make_icon` renders assets/icon.svg into assets/icon.ico.
+resvg = { version = "0.45", default-features = false }
+ico = "0.6"

@@ -93,6 +93,64 @@ impl Universe {
         }
         out
     }
+
+    /// Gate jumps from `from` to every system it can reach, at any distance.
+    pub fn distances(&self, from: u64) -> HashMap<u64, u32> {
+        self.within(from, u32::MAX).into_iter().collect()
+    }
+
+    /// The shortest gate route from `from` to `to`, both included; none when no gates lead there.
+    pub fn path(&self, from: u64, to: u64) -> Option<Vec<u64>> {
+        if !self.systems.contains_key(&from) || !self.systems.contains_key(&to) {
+            return None;
+        }
+        let mut prev: HashMap<u64, u64> = HashMap::from([(from, from)]);
+        let mut queue = VecDeque::from([from]);
+        while let Some(id) = queue.pop_front() {
+            if id == to {
+                let mut path = vec![to];
+                let mut at = to;
+                while at != from {
+                    at = prev[&at];
+                    path.push(at);
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for &next in self.gates.get(&id).map(Vec::as_slice).unwrap_or(&[]) {
+                if let std::collections::hash_map::Entry::Vacant(e) = prev.entry(next) {
+                    e.insert(id);
+                    queue.push_back(next);
+                }
+            }
+        }
+        None
+    }
+
+    /// The system named `name` (any case).
+    pub fn find(&self, name: &str) -> Option<u64> {
+        self.systems.iter().find(|(_, s)| s.name.eq_ignore_ascii_case(name)).map(|(&id, _)| id)
+    }
+
+    /// Systems whose name contains `query` (any case): names starting with it first, then the
+    /// shortest, then alphabetical. At most `limit`.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<u64> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut found: Vec<(bool, usize, &str, u64)> = self
+            .systems
+            .iter()
+            .filter_map(|(&id, s)| {
+                let name = s.name.to_lowercase();
+                let at = name.find(&q)?;
+                Some((at != 0, s.name.len(), s.name.as_str(), id))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().take(limit).map(|x| x.3).collect()
+    }
 }
 
 /// The map built into the binary, parsed on first use.
@@ -261,6 +319,46 @@ mod tests {
         let near = u.within(jita, 1);
         assert_eq!(near.len(), 1 + 7, "Jita and its seven gates");
         assert!(near.iter().any(|&(id, d)| u.system(id).unwrap().name == "Perimeter" && d == 1));
+    }
+
+    #[test]
+    fn systems_are_found_by_part_of_their_name() {
+        let u = universe();
+        let names = |q| u.search(q, 50).into_iter().map(|id| u.system(id).unwrap().name.clone()).collect::<Vec<_>>();
+        assert_eq!(names("jit").first().map(String::as_str), Some("Jita"), "a name starting with the text comes first");
+        assert!(names("AMA").iter().all(|n| n.to_lowercase().contains("ama")));
+        assert!(names("ama").contains(&"Amarr".to_string()));
+        assert!(names("  ").is_empty());
+        assert_eq!(u.search("a", 5).len(), 5);
+        assert_eq!(u.find("jita"), Some(30000142));
+    }
+
+    #[test]
+    fn distances_reach_across_the_map() {
+        let u = universe();
+        let d = u.distances(30000142);
+        assert_eq!(d[&30000142], 0);
+        let perimeter = u.find("Perimeter").unwrap();
+        assert_eq!(d[&perimeter], 1);
+        let amarr = u.find("Amarr").unwrap();
+        assert!(d[&amarr] > 5, "Amarr is a few jumps from Jita");
+        assert!(d.len() > 4000, "most of k-space is connected");
+    }
+
+    #[test]
+    fn a_path_is_as_long_as_the_distance_and_follows_gates() {
+        let u = universe();
+        let (jita, amarr) = (u.find("Jita").unwrap(), u.find("Amarr").unwrap());
+        assert_eq!(u.path(jita, jita), Some(vec![jita]));
+        let perimeter = u.find("Perimeter").unwrap();
+        assert_eq!(u.path(jita, perimeter), Some(vec![jita, perimeter]));
+        let path = u.path(jita, amarr).unwrap();
+        assert_eq!((path[0], *path.last().unwrap()), (jita, amarr));
+        assert_eq!(path.len() as u32 - 1, u.distances(jita)[&amarr]);
+        for w in path.windows(2) {
+            assert!(u.gates[&w[0]].contains(&w[1]), "a gate links each step");
+        }
+        assert_eq!(u.path(jita, 1), None);
     }
 
     #[test]
