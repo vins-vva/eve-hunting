@@ -44,7 +44,11 @@ where the ratters are before you jump.
 
 ![Routing to Amarr: the connections sorted by the jumps from their exit](shots/route-dark.png)
 
-![Points of interest: the connections within six jumps of an enemy staging](shots/poi-dark.png)
+![Points of interest: Jita, an enemy staging and another system, with the connections in range of the selected one](shots/poi-dark.png)
+
+![A POI pin's card: the points of interest within reach of Aurohunen](shots/poi-hint-dark.png)
+
+![The light theme](shots/thera-light.png)
 
 ![The settings dialog](shots/settings-dark.png)
 
