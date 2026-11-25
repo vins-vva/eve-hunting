@@ -360,7 +360,29 @@ pub fn page(s: &State, k: &Kit) -> El {
             .clip_rounded(k.radius.md)
             .child(child)
     };
-    let list_h = HEADER_H + ROW_H * s.pois.len().clamp(1, 6) as f32;
+    // The splitter divides this area between the points of interest and their connections.
+    let split = col()
+        .key("poi-split")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .on_layout(|s: &mut State, r| {
+            if s.poi_split_area_h != Some(r[3]) {
+                s.poi_split_area_h = Some(r[3]);
+            }
+        })
+        .child(frame("poi-list", poi_list(s, k)).h(list_height(s)))
+        .child(splitter(k, "poi-splitter", "Resize the points of interest and their connections", drag_splitter, |s| s.poi_list_h = None))
+        .child(
+            col()
+                .key("poi-bottom")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .gap(10.0)
+                .child(matches_header(s, k))
+                .child(frame("poi-matches", matches_table(s, k)).grow(1.0)),
+        );
     col()
         .key("poi-page")
         .w_full()
@@ -368,9 +390,35 @@ pub fn page(s: &State, k: &Kit) -> El {
         .padding(12.0)
         .gap(10.0)
         .child(status_line(s, k))
-        .child(frame("poi-list", poi_list(s, k)).h(list_h))
-        .child(matches_header(s, k))
-        .child(frame("poi-matches", matches_table(s, k)).grow(1.0))
+        .child(split)
+}
+
+// Splitter between the points of interest and their connections
+
+/// The list's height until dragged: its rows, up to six.
+fn fit_height(s: &State) -> f32 {
+    HEADER_H + ROW_H * s.pois.len().clamp(1, 6) as f32
+}
+
+/// The list keeps its header and a row; the connections keep their header and a few rows.
+const MIN_LIST_H: f32 = HEADER_H + ROW_H;
+const MIN_MATCHES_H: f32 = 150.0;
+
+fn max_list(s: &State) -> f32 {
+    s.poi_split_area_h.map_or(f32::MAX, |h| (h - SPLITTER_H - MIN_MATCHES_H).max(MIN_LIST_H))
+}
+
+/// The list's height as drawn: what the splitter set (or its rows), within what the window allows.
+pub(super) fn list_height(s: &State) -> f32 {
+    s.poi_list_h.unwrap_or_else(|| fit_height(s)).clamp(MIN_LIST_H, max_list(s))
+}
+
+fn drag_splitter(s: &mut State, d: &mut Drag) {
+    match d.phase {
+        // Remember the height at the press; moves are relative to it.
+        Phase::Down => d.data = list_height(s),
+        Phase::Move | Phase::Up => s.poi_list_h = Some((d.data + d.dy).clamp(MIN_LIST_H, max_list(s))),
+    }
 }
 
 fn status_line(s: &State, k: &Kit) -> El {

@@ -24,6 +24,9 @@ pub struct Settings {
     pub spot_security: usize,
     /// Height of the hunting section under the splitter.
     pub bottom_h: f32,
+    /// Height of the points of interest list above its splitter; `None` fits its rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poi_list_h: Option<f32>,
     pub nav_width: f32,
     pub nav_open: bool,
     /// Per page, the connections' and the spots' sort: (column, descending).
@@ -150,6 +153,7 @@ impl Default for Settings {
             only_new: false,
             spot_security: 1,
             bottom_h: 360.0,
+            poi_list_h: None,
             nav_width: 180.0,
             nav_open: true,
             sorts: Vec::new(),

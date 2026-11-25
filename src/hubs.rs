@@ -190,6 +190,10 @@ pub struct State {
     bottom_h: f32,
     /// Height of the area the splitter divides, from its last layout.
     split_area_h: Option<f32>,
+    /// Points of interest page: the list's height as dragged, `None` to fit its rows.
+    poi_list_h: Option<f32>,
+    /// Height of the area the points of interest splitter divides, from its last layout.
+    poi_split_area_h: Option<f32>,
 
     // Settings kept between runs
     theme: ThemeChoice,
@@ -287,6 +291,8 @@ pub fn init_with(saved: &Settings) -> State {
         hunts: HashMap::new(),
         bottom_h: if saved.bottom_h.is_finite() { saved.bottom_h } else { SPLIT_DEFAULT },
         split_area_h: None,
+        poi_list_h: saved.poi_list_h.filter(|h| h.is_finite()),
+        poi_split_area_h: None,
         theme: saved.theme,
         settings_open: false,
         confirm_reset: None,
@@ -416,6 +422,7 @@ fn snapshot(s: &State) -> Settings {
         only_new: s.only_new,
         spot_security: s.spot_security.index(),
         bottom_h: s.bottom_h,
+        poi_list_h: s.poi_list_h,
         nav_width: s.nav.width(),
         nav_open: s.nav.is_open(),
         sorts: s
@@ -490,6 +497,7 @@ fn reset_all(s: &mut State) {
     s.poi_sort = fresh.poi_sort.clone();
     s.poi_table.set_sort(fresh.poi_sort.0.clone(), fresh.poi_sort.1);
     s.bottom_h = fresh.bottom_h;
+    s.poi_list_h = fresh.poi_list_h;
     s.nav.set_width(fresh.nav.width());
     s.nav.set_open(fresh.nav.is_open());
     s.theme = fresh.theme;
@@ -1267,7 +1275,7 @@ fn hub_page(s: &State, k: &Kit) -> El {
             }
         })
         .child(frame(format!("conns-{hub}"), connections(s, k)).grow(1.0))
-        .child(splitter(k))
+        .child(splitter(k, "splitter", "Resize the connections and hunting spots", drag_splitter, |s| s.bottom_h = SPLIT_DEFAULT))
         .child(hunting);
     col()
         .key("page")
@@ -1280,17 +1288,17 @@ fn hub_page(s: &State, k: &Kit) -> El {
         .child(split)
 }
 
-/// A bar between the two tables: drag it to share the height, double-click to reset.
-fn splitter(k: &Kit) -> El {
-    el().key("splitter")
+/// A bar between two tables: drag it to share the height, double-click to reset.
+fn splitter(k: &Kit, key: &str, label: &str, drag: fn(&mut State, &mut Drag), reset: fn(&mut State)) -> El {
+    el().key(key)
         .w_full()
         .h(SPLITTER_H)
         .center()
         .cursor(Cursor::ResizeRow)
         .role("separator")
-        .label("Resize the connections and hunting spots")
-        .on_drag(|s: &mut State, d: &mut Drag, _: &mut Tx| drag_splitter(s, d))
-        .on_double_press(|s: &mut State| s.bottom_h = SPLIT_DEFAULT)
+        .label(label)
+        .on_drag(move |s: &mut State, d: &mut Drag, _: &mut Tx| drag(s, d))
+        .on_double_press(move |s: &mut State| reset(s))
         .child(el().w(44.0).h(4.0).radius(2.0).fill(k.c.border_strong))
 }
 
@@ -1728,6 +1736,7 @@ pub const SCENES: &[(&str, fn(&mut State))] =
         ("demo-search", demo_search),
         ("demo-poi", demo_poi),
         ("demo-poi-hint", demo_poi_hint),
+        ("demo-poi-tall", demo_poi_tall),
         ("demo-settings-confirm", demo_settings_confirm),
         ("demo-poi-add", demo_poi_add),
         ("demo-poi-edit", demo_poi_edit),
@@ -1853,6 +1862,12 @@ fn demo_turnur(s: &mut State) {
 fn demo_tall(s: &mut State) {
     demo(s);
     s.bottom_h = 560.0;
+}
+
+/// The points of interest splitter dragged down: the list takes more of the window.
+fn demo_poi_tall(s: &mut State) {
+    demo_poi(s);
+    s.poi_list_h = Some(420.0);
 }
 
 #[cfg(test)]
@@ -2155,5 +2170,20 @@ mod tests {
         assert_eq!(bottom_height(&s), 600.0 - SPLITTER_H - SPLIT_MIN_TOP);
         s.bottom_h = 10.0;
         assert_eq!(bottom_height(&s), SPLIT_MIN_BOTTOM);
+    }
+
+    #[test]
+    fn the_poi_splitter_fits_the_rows_until_dragged_and_stays_within_the_window() {
+        let mut s = loaded();
+        demo_poi(&mut s);
+        s.poi_split_area_h = Some(600.0);
+        let fit = poi::list_height(&s);
+        assert_eq!(fit, 30.0 + 40.0 * s.pois.len() as f32);
+        s.poi_list_h = Some(5000.0);
+        assert_eq!(poi::list_height(&s), 600.0 - SPLITTER_H - 150.0);
+        s.poi_list_h = Some(0.0);
+        assert_eq!(poi::list_height(&s), 70.0);
+        reset_all(&mut s);
+        assert_eq!(s.poi_list_h, None);
     }
 }

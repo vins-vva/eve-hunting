@@ -38,7 +38,7 @@ where the ratters are before you jump.
 - **Filters**: high/low/null/W-space, minimum ship size, new connections only.
 - **Quick links** for any connection or spot: copy the name (double-click a row), open the
   Dotlan region map on the system with the NPC layer, or zKillboard (Anoik.is for wormholes).
-- **Desktop niceties**: integrated titlebar, resizable splitter between the two tables, light,
+- **Desktop niceties**: integrated titlebar, resizable splitters between the tables (on every page), light,
   dark or system theme, and the window, page, filters, route target, points of interest, sorts
   and layout restored on the next launch.
 
@@ -102,7 +102,7 @@ cargo run -- --snap shots/thera-dark.png --scene demo --theme dark --size 1360x8
 
 Scenes: `demo`, `demo-turnur`, `demo-tall` (splitter dragged), `demo-null` (null-sec spots),
 `demo-settings` (dialog open), `demo-light` (light theme forced), `demo-route` (routing to
-Amarr), `demo-search` (system suggestions open), `demo-poi` (points of interest), `demo-poi-hint` (a POI pin's card), `demo-settings-confirm` (a reset to confirm),
+Amarr), `demo-search` (system suggestions open), `demo-poi` (points of interest), `demo-poi-hint` (a POI pin's card), `demo-poi-tall` (its splitter dragged), `demo-settings-confirm` (a reset to confirm),
 `demo-poi-add` and `demo-poi-edit` (its dialog).
 
 To regenerate the stargate map after CCP adds systems:
